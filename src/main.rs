@@ -895,6 +895,85 @@ fn run_convbench() -> Result<()> {
     Ok(())
 }
 
+/// Isolated A/B of the Metal conv2d: im2col path (HANZO_METAL_MPS unset) vs MPSGraph path
+/// (HANZO_METAL_MPS=1), across the VAE/TAESD/UNet conv shapes. Reports per-conv us and the
+/// im2col-vs-MPS output cosine (numeric parity gate). Toggles the env var in-process.
+#[cfg(feature = "metal")]
+fn run_convbench_metal() -> Result<()> {
+    use hanzo_nn::{Conv2d, Conv2dConfig};
+    let dev = pick_device()?;
+    if !dev.is_metal() {
+        hanzo_ml::bail!("convbench-metal requires MUSETALK_DEV=metal");
+    }
+    let dtype = pick_dtype();
+    let bsz: usize = std::env::var("MUSETALK_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let iters: usize = std::env::var("MUSETALK_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+
+    // (C_in, C_out, HW, stride, label): VAE conv_in/out + the dominant 3x3 blocks at each res.
+    let shapes: &[(usize, usize, usize, usize, &str)] = &[
+        (3, 128, 256, 1, "vae conv_in 3->128 @256"),
+        (128, 128, 256, 1, "vae block 128->128 @256"),
+        (128, 256, 128, 1, "vae block 128->256 @128"),
+        (256, 512, 64, 1, "vae block 256->512 @64"),
+        (512, 512, 64, 1, "vae block 512->512 @64"),
+        (3, 64, 256, 1, "taesd conv_in 3->64 @256"),
+        (64, 64, 256, 1, "taesd block 64->64 @256"),
+        (64, 64, 128, 1, "taesd block 64->64 @128"),
+        (64, 4, 32, 1, "taesd conv_out 64->4 @32"),
+    ];
+
+    println!(
+        "\n==== Metal conv2d A/B  dev=metal dtype={dtype:?} batch={bsz} iters={iters} ====",
+    );
+    println!("(3x3 pad1; us per conv; im2col = HANZO_METAL_MPS unset, mps = MPSGraph)");
+    println!("{:<28} {:>10} {:>10} {:>8} {:>9}", "shape", "im2col us", "mps us", "speedup", "cosine");
+
+    let run_one = |layer: &Conv2d, x: &Tensor| -> Result<Tensor> {
+        hanzo_quant::Convolution.forward_2d(layer, x)
+    };
+
+    let (mut tot_im, mut tot_mps, mut worst_cos) = (0f64, 0f64, 2f64);
+    for &(c_in, c_out, hw, stride, label) in shapes {
+        let cfg = Conv2dConfig { padding: 1, stride, dilation: 1, groups: 1, cudnn_fwd_algo: None };
+        let x = seeded_input(0x123, &[bsz, c_in, hw, hw], &dev)?.to_dtype(dtype)?;
+        let w = seeded_input(0x456, &[c_out, c_in, 3, 3], &dev)?.to_dtype(dtype)?;
+        let b = seeded_input(0x789, &[c_out], &dev)?.to_dtype(dtype)?;
+        let layer = Conv2d::new(w, Some(b), cfg);
+
+        // numerics + warmup, both paths
+        std::env::remove_var("HANZO_METAL_MPS");
+        let im_out = run_one(&layer, &x)?;
+        std::env::set_var("HANZO_METAL_MPS", "1");
+        let mps_out = run_one(&layer, &x)?;
+        std::env::remove_var("HANZO_METAL_MPS");
+        let (_p, cos) = psnr_cosine(&im_out, &mps_out)?;
+        worst_cos = worst_cos.min(cos);
+
+        for _ in 0..5 { let _ = run_one(&layer, &x)?; }
+        dev.synchronize()?;
+        let t0 = Instant::now();
+        for _ in 0..iters { let _ = run_one(&layer, &x)?; }
+        dev.synchronize()?;
+        let im_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        std::env::set_var("HANZO_METAL_MPS", "1");
+        for _ in 0..5 { let _ = run_one(&layer, &x)?; }
+        dev.synchronize()?;
+        let t1 = Instant::now();
+        for _ in 0..iters { let _ = run_one(&layer, &x)?; }
+        dev.synchronize()?;
+        let mps_us = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        std::env::remove_var("HANZO_METAL_MPS");
+
+        tot_im += im_us;
+        tot_mps += mps_us;
+        println!("{:<28} {:>10.1} {:>10.1} {:>7.2}x {:>9.5}", label, im_us, mps_us, im_us / mps_us.max(1e-9), cos);
+    }
+    println!("{:<28} {:>10.1} {:>10.1} {:>7.2}x", "TOTAL (one of each)", tot_im, tot_mps, tot_im / tot_mps.max(1e-9));
+    println!("worst-shape cosine: {worst_cos:.6}  (target > 0.999)");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "bench".to_string());
     let dev = pick_device()?;
@@ -909,6 +988,8 @@ fn main() -> Result<()> {
         "convbench" => run_convbench()?,
         #[cfg(not(feature = "cuda"))]
         "convbench" => hanzo_ml::bail!("convbench is cuda-only (custom SIMT conv kernel)"),
+        #[cfg(feature = "metal")]
+        "convbench-metal" => run_convbench_metal()?,
         _ => run_bench(&dev)?,
     }
     Ok(())
