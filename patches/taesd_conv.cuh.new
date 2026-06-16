@@ -1,0 +1,344 @@
+// High-occupancy direct 3x3 convolution kernels for the TAESD tiny-encoder/decoder.
+// Targets the low-channel-count (C<=64) high-resolution convs (256/128/64 spatial) where cuDNN's
+// implicit-GEMM underfills the tensor-core MMA tiles and runs at a small fraction of peak. A direct
+// SIMT kernel that stages the input tile in shared memory (loaded once, reused 9*C_out times) and
+// streams the small weight tensor from L2 reaches far higher occupancy on these shapes.
+//
+// Layout: NCHW in/out, f16 storage with f32 accumulation. 3x3 kernel, pad 1, stride 1 or 2.
+// Optional per-channel bias and optional fused ReLU (TAESD blocks are conv->relu chains).
+// Included at the end of conv.cu, which already pulls in cuda_utils.cuh / stdint.
+
+#ifndef TAESD_TH
+#define TAESD_TH 8
+#endif
+#ifndef TAESD_TW
+#define TAESD_TW 16
+#endif
+
+// One block computes a TH x TW output tile for ALL C_out channels of one batch element.
+// blockDim = (TW, TH). Shared memory holds the input receptive field for the tile across all C_in.
+// Each thread owns one output pixel and loops over output channels, accumulating in f32.
+template <int TH, int TW>
+__device__ __forceinline__ void taesd_conv3x3_impl(
+    const __half *__restrict__ src,    // (N, C_in, H, W)
+    const __half *__restrict__ weight, // (C_out, C_in, 3, 3)
+    const __half *__restrict__ bias,   // (C_out); valid only when do_bias
+    __half *__restrict__ dst,          // (N, C_out, H_out, W_out)
+    const int N, const int C_in, const int C_out,
+    const int H, const int W, const int H_out, const int W_out,
+    const int stride, const int do_relu, const int do_bias)
+{
+    extern __shared__ __half smem[]; // (C_in, halo_h, halo_w)
+    const int halo_h = TH * stride + 2;
+    const int halo_w = TW * stride + 2;
+    const int tile_oh = blockIdx.y * TH;
+    const int tile_ow = blockIdx.x * TW;
+    const int n = blockIdx.z;
+
+    // Top-left input coord of this tile's receptive field (stride*out - pad), pad=1.
+    const int in_h0 = tile_oh * stride - 1;
+    const int in_w0 = tile_ow * stride - 1;
+
+    const int tx = threadIdx.x; // 0..TW-1
+    const int ty = threadIdx.y; // 0..TH-1
+    const int tid = ty * TW + tx;
+    const int nthreads = TW * TH;
+    const int halo_hw = halo_h * halo_w;
+
+    // Cooperative load of the input halo into shared memory, zero-padded at the image border.
+    const __half zero = __float2half(0.0f);
+    for (int c = 0; c < C_in; ++c) {
+        const __half *src_c = src + ((size_t)(n * C_in + c)) * H * W;
+        __half *sm_c = smem + (size_t)c * halo_hw;
+        for (int idx = tid; idx < halo_hw; idx += nthreads) {
+            const int hh = idx / halo_w;
+            const int ww = idx % halo_w;
+            const int ih = in_h0 + hh;
+            const int iw = in_w0 + ww;
+            __half v = zero;
+            if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                v = src_c[ih * W + iw];
+            }
+            sm_c[idx] = v;
+        }
+    }
+    __syncthreads();
+
+    const int oh = tile_oh + ty;
+    const int ow = tile_ow + tx;
+    const int active = (oh < H_out && ow < W_out);
+
+    // This thread's input window top-left within shared memory (stride within tile).
+    const int sh0 = ty * stride;
+    const int sw0 = tx * stride;
+
+    for (int oc = 0; oc < C_out; ++oc) {
+        float acc = do_bias ? __half2float(bias[oc]) : 0.0f;
+        const __half *w_oc = weight + (size_t)oc * C_in * 9;
+        if (active) {
+            for (int c = 0; c < C_in; ++c) {
+                const __half *sm_c = smem + (size_t)c * halo_hw;
+                const __half *w_c = w_oc + c * 9;
+                #pragma unroll
+                for (int ky = 0; ky < 3; ++ky) {
+                    const __half *sm_row = sm_c + (sh0 + ky) * halo_w + sw0;
+                    #pragma unroll
+                    for (int kx = 0; kx < 3; ++kx) {
+                        acc += __half2float(sm_row[kx]) * __half2float(w_c[ky * 3 + kx]);
+                    }
+                }
+            }
+            if (do_relu && acc < 0.0f) acc = 0.0f;
+            dst[(((size_t)(n * C_out + oc)) * H_out + oh) * W_out + ow] = __float2half(acc);
+        }
+    }
+}
+
+extern "C" __global__ void taesd_conv3x3_f16(
+    const __half *src, const __half *weight, const __half *bias, __half *dst,
+    const int N, const int C_in, const int C_out,
+    const int H, const int W, const int H_out, const int W_out,
+    const int stride, const int do_relu, const int do_bias)
+{
+    taesd_conv3x3_impl<TAESD_TH, TAESD_TW>(
+        src, weight, bias, dst, N, C_in, C_out, H, W, H_out, W_out, stride, do_relu, do_bias);
+}
+
+// Channel-register-blocked variant: each thread accumulates OCB output channels at once so each
+// shared-memory input read is reused across OCB weights, raising arithmetic intensity and cutting
+// shared-load traffic by OCB. Best for the dominant C_out=64 stride-1 convs.
+template <int TH, int TW, int OCB>
+__device__ __forceinline__ void taesd_conv3x3_ocb_impl(
+    const __half *__restrict__ src,
+    const __half *__restrict__ weight,
+    const __half *__restrict__ bias,
+    __half *__restrict__ dst,
+    const int N, const int C_in, const int C_out,
+    const int H, const int W, const int H_out, const int W_out,
+    const int stride, const int do_relu, const int do_bias)
+{
+    extern __shared__ __half smem[];
+    const int halo_h = TH * stride + 2;
+    const int halo_w = TW * stride + 2;
+    const int tile_oh = blockIdx.y * TH;
+    const int tile_ow = blockIdx.x * TW;
+    const int n = blockIdx.z;
+    const int in_h0 = tile_oh * stride - 1;
+    const int in_w0 = tile_ow * stride - 1;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * TW + tx;
+    const int nthreads = TW * TH;
+    const int halo_hw = halo_h * halo_w;
+
+    const __half zero = __float2half(0.0f);
+    for (int c = 0; c < C_in; ++c) {
+        const __half *src_c = src + ((size_t)(n * C_in + c)) * H * W;
+        __half *sm_c = smem + (size_t)c * halo_hw;
+        for (int idx = tid; idx < halo_hw; idx += nthreads) {
+            const int hh = idx / halo_w;
+            const int ww = idx % halo_w;
+            const int ih = in_h0 + hh;
+            const int iw = in_w0 + ww;
+            __half v = zero;
+            if (ih >= 0 && ih < H && iw >= 0 && iw < W) v = src_c[ih * W + iw];
+            sm_c[idx] = v;
+        }
+    }
+    __syncthreads();
+
+    const int oh = tile_oh + ty;
+    const int ow = tile_ow + tx;
+    const int active = (oh < H_out && ow < W_out);
+    const int sh0 = ty * stride;
+    const int sw0 = tx * stride;
+
+    for (int oc0 = 0; oc0 < C_out; oc0 += OCB) {
+        float acc[OCB];
+        #pragma unroll
+        for (int j = 0; j < OCB; ++j) acc[j] = (do_bias && oc0 + j < C_out) ? __half2float(bias[oc0 + j]) : 0.0f;
+        if (active) {
+            for (int c = 0; c < C_in; ++c) {
+                const __half *sm_c = smem + (size_t)c * halo_hw;
+                #pragma unroll
+                for (int ky = 0; ky < 3; ++ky) {
+                    const __half *sm_row = sm_c + (sh0 + ky) * halo_w + sw0;
+                    #pragma unroll
+                    for (int kx = 0; kx < 3; ++kx) {
+                        const float sv = __half2float(sm_row[kx]);
+                        #pragma unroll
+                        for (int j = 0; j < OCB; ++j) {
+                            const __half *w_oc = weight + (size_t)(oc0 + j) * C_in * 9;
+                            acc[j] += sv * __half2float(w_oc[c * 9 + ky * 3 + kx]);
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < OCB; ++j) {
+                if (oc0 + j < C_out) {
+                    float a = acc[j];
+                    if (do_relu && a < 0.0f) a = 0.0f;
+                    dst[(((size_t)(n * C_out + oc0 + j)) * H_out + oh) * W_out + ow] = __float2half(a);
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void taesd_conv3x3_ocb4_f16(
+    const __half *src, const __half *weight, const __half *bias, __half *dst,
+    const int N, const int C_in, const int C_out,
+    const int H, const int W, const int H_out, const int W_out,
+    const int stride, const int do_relu, const int do_bias)
+{
+    taesd_conv3x3_ocb_impl<TAESD_TH, TAESD_TW, 4>(
+        src, weight, bias, dst, N, C_in, C_out, H, W, H_out, W_out, stride, do_relu, do_bias);
+}
+// v2: register-blocked direct 3x3 conv for stride-1 64-channel TAESD blocks. Each thread owns a
+// PH x PW micro-tile of output pixels for a slab of OCB output channels, accumulating in registers.
+// The input halo is staged in shared memory once; the weight slab for the current output-channel
+// block is also staged in shared memory and reused across the whole pixel tile. This raises
+// arithmetic intensity (each shared load feeds PH*PW*OCB FMAs) and reuses weights from shared
+// instead of re-streaming them from L2 per pixel as v1 did.
+//
+// Block computes a (TPH*PH) x (TPW*PW) output tile for all C_out channels of one batch element.
+// blockDim = (TPW, TPH). Stride-1, pad-1, 3x3 only. f16 in/out, f32 accumulate, fused bias+relu.
+
+#ifndef TAESD_TPH
+#define TAESD_TPH 8
+#endif
+#ifndef TAESD_TPW
+#define TAESD_TPW 8
+#endif
+#ifndef TAESD_PH
+#define TAESD_PH 2
+#endif
+#ifndef TAESD_PW
+#define TAESD_PW 2
+#endif
+
+template <int TPH, int TPW, int PH, int PW, int OCB>
+__device__ __forceinline__ void taesd_conv3x3_reg_impl(
+    const __half *__restrict__ src,
+    const __half *__restrict__ weight,
+    const __half *__restrict__ bias,
+    __half *__restrict__ dst,
+    const int N, const int C_in, const int C_out,
+    const int H, const int W, const int H_out, const int W_out,
+    const int do_relu, const int do_bias)
+{
+    constexpr int TH = TPH * PH; // output tile height in pixels
+    constexpr int TW = TPW * PW; // output tile width in pixels
+    const int halo_h = TH + 2;
+    const int halo_w = TW + 2;
+    const int halo_hw = halo_h * halo_w;
+
+    extern __shared__ __half smem[];
+    __half *sm_in = smem;                       // (C_in, halo_h, halo_w)
+    __half *sm_w = smem + (size_t)C_in * halo_hw; // (OCB, C_in, 3, 3) for the current oc block
+
+    const int tile_oh = blockIdx.y * TH;
+    const int tile_ow = blockIdx.x * TW;
+    const int n = blockIdx.z;
+    const int in_h0 = tile_oh - 1;
+    const int in_w0 = tile_ow - 1;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * TPW + tx;
+    const int nthreads = TPW * TPH;
+
+    // Stage the full input halo for this tile across all C_in.
+    const __half zero = __float2half(0.0f);
+    for (int c = 0; c < C_in; ++c) {
+        const __half *src_c = src + ((size_t)(n * C_in + c)) * H * W;
+        __half *smc = sm_in + (size_t)c * halo_hw;
+        for (int idx = tid; idx < halo_hw; idx += nthreads) {
+            const int hh = idx / halo_w;
+            const int ww = idx % halo_w;
+            const int ih = in_h0 + hh;
+            const int iw = in_w0 + ww;
+            smc[idx] = (ih >= 0 && ih < H && iw >= 0 && iw < W) ? src_c[ih * W + iw] : zero;
+        }
+    }
+
+    // This thread's top-left output pixel in the tile.
+    const int p_oh = ty * PH;
+    const int p_ow = tx * PW;
+
+    for (int oc0 = 0; oc0 < C_out; oc0 += OCB) {
+        const int ocn = min(OCB, C_out - oc0);
+        // Cooperatively stage the weight slab for [oc0, oc0+ocn) into shared memory.
+        const int wcount = ocn * C_in * 9;
+        for (int idx = tid; idx < wcount; idx += nthreads) {
+            sm_w[idx] = weight[(size_t)oc0 * C_in * 9 + idx];
+        }
+        __syncthreads();
+
+        float acc[OCB][PH][PW];
+        #pragma unroll
+        for (int o = 0; o < OCB; ++o)
+            #pragma unroll
+            for (int i = 0; i < PH; ++i)
+                #pragma unroll
+                for (int j = 0; j < PW; ++j)
+                    acc[o][i][j] = (do_bias && oc0 + o < C_out) ? __half2float(bias[oc0 + o]) : 0.0f;
+
+        for (int c = 0; c < C_in; ++c) {
+            const __half *smc = sm_in + (size_t)c * halo_hw;
+            const __half *smwc = sm_w + (size_t)c * 9; // weight for channel c, base; oc stride = C_in*9
+            #pragma unroll
+            for (int ky = 0; ky < 3; ++ky) {
+                #pragma unroll
+                for (int kx = 0; kx < 3; ++kx) {
+                    // Load weights for this (c,ky,kx) across the OCB output channels.
+                    float wv[OCB];
+                    #pragma unroll
+                    for (int o = 0; o < OCB; ++o)
+                        wv[o] = __half2float(smwc[(size_t)o * C_in * 9 + ky * 3 + kx]);
+                    // Load the PH*PW input window samples once, reuse across OCB.
+                    #pragma unroll
+                    for (int i = 0; i < PH; ++i) {
+                        const int srow = (p_oh + i + ky) * halo_w + (p_ow + kx);
+                        #pragma unroll
+                        for (int j = 0; j < PW; ++j) {
+                            const float sv = __half2float(smc[srow + j]);
+                            #pragma unroll
+                            for (int o = 0; o < OCB; ++o)
+                                acc[o][i][j] += sv * wv[o];
+                        }
+                    }
+                }
+            }
+        }
+        // Write back.
+        #pragma unroll
+        for (int o = 0; o < OCB; ++o) {
+            if (oc0 + o >= C_out) continue;
+            #pragma unroll
+            for (int i = 0; i < PH; ++i) {
+                const int oh = tile_oh + p_oh + i;
+                if (oh >= H_out) continue;
+                #pragma unroll
+                for (int j = 0; j < PW; ++j) {
+                    const int ow = tile_ow + p_ow + j;
+                    if (ow >= W_out) continue;
+                    float a = acc[o][i][j];
+                    if (do_relu && a < 0.0f) a = 0.0f;
+                    dst[(((size_t)(n * C_out + oc0 + o)) * H_out + oh) * W_out + ow] = __float2half(a);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void taesd_conv3x3_reg_f16(
+    const __half *src, const __half *weight, const __half *bias, __half *dst,
+    const int N, const int C_in, const int C_out,
+    const int H, const int W, const int H_out, const int W_out,
+    const int do_relu, const int do_bias)
+{
+    taesd_conv3x3_reg_impl<TAESD_TPH, TAESD_TPW, TAESD_PH, TAESD_PW, 8>(
+        src, weight, bias, dst, N, C_in, C_out, H, W, H_out, W_out, do_relu, do_bias);
+}

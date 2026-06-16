@@ -1,0 +1,51 @@
+--- /home/z/work/hanzo/ml/hanzo-ml/src/cuda_backend/cudnn.rs	2026-06-01 18:52:58.000000000 +0000
++++ /home/z/work/sw-perf/ml/hanzo-ml/src/cuda_backend/cudnn.rs	2026-06-16 00:44:04.001263928 +0000
+@@ -94,19 +94,36 @@
+         w: &w,
+         y: &y,
+     };
+-    let alg = match params.cudnn_fwd_algo {
+-        None => conv2d.pick_algorithm()?,
+-        Some(HanzoAlgo::ImplicitGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
+-        Some(HanzoAlgo::ImplicitPrecompGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
+-        Some(HanzoAlgo::Gemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
+-        Some(HanzoAlgo::Direct) => A::CUDNN_CONVOLUTION_FWD_ALGO_DIRECT,
+-        Some(HanzoAlgo::Fft) => A::CUDNN_CONVOLUTION_FWD_ALGO_FFT,
+-        Some(HanzoAlgo::FftTiling) => A::CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING,
+-        Some(HanzoAlgo::Winograd) => A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD,
+-        Some(HanzoAlgo::WinogradNonFused) => A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED,
+-        Some(HanzoAlgo::Count) => A::CUDNN_CONVOLUTION_FWD_ALGO_COUNT,
++    // Spatial-aware algo: implicit-GEMM wins on large-spatial TAESD convs (256/128),
++    // but cuDNN's explicit GEMM (im2col+cublas) is faster on the UNet's small 32x32
++    // high-channel convs. `mixed` picks per-shape; `gemm` forces explicit everywhere.
++    let small_spatial = params.i_h * params.i_w <= 2048;
++    let mut alg = match std::env::var("MUSETALK_CUDNN_ALGO").as_deref() {
++        Ok("mixed") if small_spatial => A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
++        Ok("mixed") => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
++        Ok("gemm") => A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
++        _ => match params.cudnn_fwd_algo {
++            None => conv2d.pick_algorithm()?,
++            Some(HanzoAlgo::ImplicitGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
++            Some(HanzoAlgo::ImplicitPrecompGemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
++            Some(HanzoAlgo::Gemm) => A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
++            Some(HanzoAlgo::Direct) => A::CUDNN_CONVOLUTION_FWD_ALGO_DIRECT,
++            Some(HanzoAlgo::Fft) => A::CUDNN_CONVOLUTION_FWD_ALGO_FFT,
++            Some(HanzoAlgo::FftTiling) => A::CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING,
++            Some(HanzoAlgo::Winograd) => A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD,
++            Some(HanzoAlgo::WinogradNonFused) => A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED,
++            Some(HanzoAlgo::Count) => A::CUDNN_CONVOLUTION_FWD_ALGO_COUNT,
++        },
++    };
++    // A forced algo (e.g. Winograd) may be unsupported for some shapes; fall back to the
++    // cuDNN heuristic rather than erroring the whole conv.
++    let workspace_size = match conv2d.get_workspace_size(alg) {
++        Ok(ws) => ws,
++        Err(_) => {
++            alg = conv2d.pick_algorithm()?;
++            conv2d.get_workspace_size(alg)?
++        }
+     };
+-    let workspace_size = conv2d.get_workspace_size(alg)?;
+     let mut workspace = dev.cuda_stream().alloc_zeros::<u8>(workspace_size)?;
+     unsafe {
+         conv2d.launch::<CudaSlice<u8>, _, _, _>(
