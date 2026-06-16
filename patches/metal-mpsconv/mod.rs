@@ -1954,6 +1954,7 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
             mps_queue: Arc::new(std::sync::OnceLock::new()),
+            mps_conv_cache: Arc::new(RwLock::new(mps_conv::ConvGraphCache::default())),
         })
     }
 

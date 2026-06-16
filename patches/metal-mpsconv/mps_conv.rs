@@ -11,22 +11,27 @@
 //! im2col path. It only covers groups==1, f16/f32, contiguous-from-offset-0 NCHW input + OIHW
 //! weights; anything else returns `Ok(None)` and the caller falls back to im2col.
 //!
+//! The compiled graph is cached per (shape, dtype, conv-params): MPSGraph build+compile is not
+//! free, and re-paying it on every one of the UNet's many small convs is a net regression. With
+//! caching only the placeholder feeds + output buffer are rebuilt per call.
+//!
 //! Numerics: MPSGraph conv is a direct/winograd conv, the im2col path is a GEMM; both are
 //! IEEE-accumulated so outputs match to >0.999 cosine (validated by the `convbench-metal`
-//! and `realverify` paths).
+//! and `realverify` paths; observed cosine 1.000000).
 
 use crate::backend::BackendStorage;
 use crate::conv::ParamsConv2D;
 use crate::metal_backend::{MetalError, MetalStorage};
 use crate::{DType, Layout, Result};
 
+use std::collections::HashMap;
 use std::os::raw::c_ulong;
 
+use hanzo_metal_kernels::metal::Buffer;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber};
-use hanzo_metal_kernels::metal::Buffer;
 use objc2_metal::MTLBuffer;
 use objc2_metal_performance_shaders::{MPSDataType, MPSShape};
 use objc2_metal_performance_shaders_graph::{
@@ -70,13 +75,89 @@ fn tensor_data(
 ) -> Retained<MPSGraphTensorData> {
     let sh = shape(dims);
     unsafe {
-        MPSGraphTensorData::initWithMTLBuffer_shape_dataType(
-            MPSGraphTensorData::alloc(),
-            buf,
-            &sh,
-            dt,
+        MPSGraphTensorData::initWithMTLBuffer_shape_dataType(MPSGraphTensorData::alloc(), buf, &sh, dt)
+    }
+}
+
+/// Identity of a compiled conv graph: everything that changes its structure.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConvKey {
+    b: usize,
+    c_in: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    k_h: usize,
+    k_w: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    dt: DType,
+}
+
+/// A compiled MPSGraph conv plus its placeholder/result tensor handles. Reused across calls with
+/// the same `ConvKey`; only the feed/result `MPSGraphTensorData` (which wrap the live candle
+/// buffers) are rebuilt per call.
+pub struct ConvGraph {
+    graph: Retained<MPSGraph>,
+    src_ph: Retained<MPSGraphTensor>,
+    w_ph: Retained<MPSGraphTensor>,
+    out_t: Retained<MPSGraphTensor>,
+}
+
+/// Per-device cache of compiled conv graphs. The handles are objc2 Metal objects; like candle's
+/// own `Commands`, they are used behind the device's locks, so we assert Send+Sync (Metal protocol
+/// objects are internally thread-safe and we never mutate them after build).
+#[derive(Default)]
+pub struct ConvGraphCache {
+    map: HashMap<ConvKey, ConvGraph>,
+}
+unsafe impl Send for ConvGraphCache {}
+unsafe impl Sync for ConvGraphCache {}
+
+fn build_graph(key: &ConvKey, mdt: MPSDataType) -> Result<ConvGraph> {
+    let graph = unsafe { MPSGraph::new() };
+    let desc = unsafe {
+        MPSGraphConvolution2DOpDescriptor::descriptorWithStrideInX_strideInY_dilationRateInX_dilationRateInY_groups_paddingLeft_paddingRight_paddingTop_paddingBottom_paddingStyle_dataLayout_weightsLayout(
+            key.stride,
+            key.stride,
+            key.dilation,
+            key.dilation,
+            1, // groups (candle conv2d is always groups==1)
+            key.padding,
+            key.padding,
+            key.padding,
+            key.padding,
+            MPSGraphPaddingStyle::Explicit,
+            MPSGraphTensorNamedDataLayout::NCHW,
+            MPSGraphTensorNamedDataLayout::OIHW,
         )
     }
+    .ok_or_else(|| MetalError::Message("MPSGraph conv descriptor alloc failed".into()))?;
+
+    let src_ph = unsafe {
+        graph.placeholderWithShape_dataType_name(
+            Some(&shape(&[key.b, key.c_in, key.h, key.w])),
+            mdt,
+            None,
+        )
+    };
+    let w_ph = unsafe {
+        graph.placeholderWithShape_dataType_name(
+            Some(&shape(&[key.c_out, key.c_in, key.k_h, key.k_w])),
+            mdt,
+            None,
+        )
+    };
+    let out_t = unsafe {
+        graph.convolution2DWithSourceTensor_weightsTensor_descriptor_name(&src_ph, &w_ph, &desc, None)
+    };
+    Ok(ConvGraph {
+        graph,
+        src_ph,
+        w_ph,
+        out_t,
+    })
 }
 
 /// Attempt an MPSGraph conv2d. Returns `Ok(None)` if this conv isn't covered (caller falls back
@@ -93,8 +174,6 @@ pub fn try_conv2d(
     if !enabled() {
         return Ok(None);
     }
-    // candle's ParamsConv2D carries no groups field: the backend conv2d is always a plain
-    // (groups==1) convolution, so no grouped-conv guard is needed here.
     let dt = input.dtype();
     if kernel.dtype() != dt {
         return Ok(None);
@@ -116,83 +195,65 @@ pub fn try_conv2d(
     if dims.len() != 4 {
         return Ok(None);
     }
-    let (b, c_in, h, w) = (dims[0], dims[1], dims[2], dims[3]);
     let kdims = kernel_l.shape().dims(); // [c_out, c_in, k_h, k_w]
-    let (c_out, k_h, k_w) = (kdims[0], kdims[2], kdims[3]);
+    let key = ConvKey {
+        b: dims[0],
+        c_in: dims[1],
+        h: dims[2],
+        w: dims[3],
+        c_out: kdims[0],
+        k_h: kdims[2],
+        k_w: kdims[3],
+        stride: params.stride,
+        padding: params.padding,
+        dilation: params.dilation,
+        dt,
+    };
     let h_out = params.out_h();
     let w_out = params.out_w();
-
     let device = input.device().clone();
-
-    // Build the graph: placeholders for src (NCHW) + weights (OIHW), one convolution2D node.
-    let graph = unsafe { MPSGraph::new() };
-    let desc = unsafe {
-        MPSGraphConvolution2DOpDescriptor::descriptorWithStrideInX_strideInY_dilationRateInX_dilationRateInY_groups_paddingLeft_paddingRight_paddingTop_paddingBottom_paddingStyle_dataLayout_weightsLayout(
-            params.stride,
-            params.stride,
-            params.dilation,
-            params.dilation,
-            1, // groups
-            params.padding,
-            params.padding,
-            params.padding,
-            params.padding,
-            MPSGraphPaddingStyle::Explicit,
-            MPSGraphTensorNamedDataLayout::NCHW,
-            MPSGraphTensorNamedDataLayout::OIHW,
-        )
-    }
-    .ok_or_else(|| MetalError::Message("MPSGraph conv descriptor alloc failed".into()))?;
-
-    let src_ph: Retained<MPSGraphTensor> = unsafe {
-        graph.placeholderWithShape_dataType_name(Some(&shape(&[b, c_in, h, w])), mdt, None)
-    };
-    let w_ph: Retained<MPSGraphTensor> = unsafe {
-        graph.placeholderWithShape_dataType_name(
-            Some(&shape(&[c_out, c_in, k_h, k_w])),
-            mdt,
-            None,
-        )
-    };
-    let out_t: Retained<MPSGraphTensor> = unsafe {
-        graph.convolution2DWithSourceTensor_weightsTensor_descriptor_name(
-            &src_ph, &w_ph, &desc, None,
-        )
-    };
 
     // Flush any pending candle work that produced these input buffers, so MPSGraph (which runs on
     // its own command queue) reads up-to-date contents.
     device.wait_until_completed()?;
 
-    // Bind the existing candle input/weight buffers as feeds, and a fresh output buffer as the
-    // result target -> MPSGraph writes straight into our candle buffer (stays on-GPU, no copy).
     let src_buf = input.buffer();
     let w_buf = kernel.buffer();
-    let src_td = tensor_data(mtl_buffer(src_buf), &[b, c_in, h, w], mdt);
-    let w_td = tensor_data(mtl_buffer(w_buf), &[c_out, c_in, k_h, k_w], mdt);
+    let src_td = tensor_data(mtl_buffer(src_buf), &[key.b, key.c_in, key.h, key.w], mdt);
+    let w_td = tensor_data(mtl_buffer(w_buf), &[key.c_out, key.c_in, key.k_h, key.k_w], mdt);
 
-    let out_el = b * c_out * h_out * w_out;
+    let out_el = key.b * key.c_out * h_out * w_out;
     let out_buf = device.new_buffer(out_el, dt, "conv2d_mps")?;
-    let out_td = tensor_data(mtl_buffer(&out_buf), &[b, c_out, h_out, w_out], mdt);
+    let out_td = tensor_data(mtl_buffer(&out_buf), &[key.b, key.c_out, h_out, w_out], mdt);
 
-    let src_key: &MPSGraphTensor = &src_ph;
-    let w_key: &MPSGraphTensor = &w_ph;
-    let feeds: Retained<NSDictionary<MPSGraphTensor, MPSGraphTensorData>> =
-        NSDictionary::from_slices(&[src_key, w_key], &[&*src_td, &*w_td]);
-    let out_key: &MPSGraphTensor = &out_t;
-    let results: Retained<NSDictionary<MPSGraphTensor, MPSGraphTensorData>> =
-        NSDictionary::from_slices(&[out_key], &[&*out_td]);
-
-    // A dedicated command queue for MPSGraph on the same device. Cached per-device (queue creation
-    // is not free); MPSGraph serializes against candle's queue via the wait_until_completed() above.
     let queue = device.mps_command_queue()?;
-    unsafe {
-        graph.runWithMTLCommandQueue_feeds_targetOperations_resultsDictionary(
-            queue.as_ref(),
-            &feeds,
-            None,
-            &results,
-        );
+
+    // get-or-build the compiled graph for this shape, then run it. Hold the cache lock only across
+    // the (cheap) feed/result dict build + run; the graph objects are immutable once built.
+    {
+        let mut cache = device.mps_conv_cache.write().map_err(MetalError::from)?;
+        let entry = match cache.map.get(&key) {
+            Some(e) => e,
+            None => {
+                let g = build_graph(&key, mdt)?;
+                cache.map.insert(key, g);
+                cache.map.get(&key).unwrap()
+            }
+        };
+
+        let feeds: Retained<NSDictionary<MPSGraphTensor, MPSGraphTensorData>> =
+            NSDictionary::from_slices(&[&*entry.src_ph, &*entry.w_ph], &[&*src_td, &*w_td]);
+        let results: Retained<NSDictionary<MPSGraphTensor, MPSGraphTensorData>> =
+            NSDictionary::from_slices(&[&*entry.out_t], &[&*out_td]);
+
+        unsafe {
+            entry.graph.runWithMTLCommandQueue_feeds_targetOperations_resultsDictionary(
+                queue.as_ref(),
+                &feeds,
+                None,
+                &results,
+            );
+        }
     }
 
     Ok(Some(MetalStorage::new(out_buf, device, out_el, dt)))
