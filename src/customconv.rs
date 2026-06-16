@@ -8,22 +8,36 @@
 //!
 //! Gated by MUSETALK_CUSTOM_CONV=1. Falls back to the standard cuDNN/im2col path otherwise, and for
 //! any shape the kernel doesn't cover (non-3x3, dtype != f16, CPU).
+//!
+//! The custom kernel is CUDA-only (cudarc + hanzo-kernels). On non-CUDA backends (Metal, Vulkan,
+//! CPU) this module compiles to a stub: `covers()` is always false and `forward()` bails, so the
+//! TAESD conv dispatch in `taesd.rs` always takes the standard `hanzo_quant::Convolution` path.
 
+#[cfg(feature = "cuda")]
 use half::f16;
+#[cfg(feature = "cuda")]
 use hanzo_ml::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+#[cfg(feature = "cuda")]
 use hanzo_ml::backend::BackendStorage;
+#[cfg(feature = "cuda")]
 use hanzo_ml::cuda_backend::{kernels, CudaStorage};
-use hanzo_ml::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
+#[cfg(feature = "cuda")]
+use hanzo_ml::{CpuStorage, CustomOp2, Layout, Shape};
+use hanzo_ml::{DType, Result, Tensor};
 use hanzo_nn::Conv2d;
 
+#[cfg(feature = "cuda")]
 const TH: u32 = 8;
+#[cfg(feature = "cuda")]
 const TW: u32 = 16;
+#[cfg(feature = "cuda")]
 const SMEM_STATIC_CAP: usize = 48 * 1024;
 
 pub fn enabled() -> bool {
     std::env::var("MUSETALK_CUSTOM_CONV").is_ok()
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Variant {
     Simple,
@@ -31,6 +45,7 @@ enum Variant {
     Reg,
 }
 
+#[cfg(feature = "cuda")]
 fn pick_variant(c_out: usize, stride: usize) -> Variant {
     // OCB4 register-blocks 4 output channels per shared read; best when C_out is a multiple of 4
     // and large enough to amortize (the dominant 64->64 convs). Fall back to the simple kernel
@@ -52,12 +67,14 @@ fn pick_variant(c_out: usize, stride: usize) -> Variant {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct TaesdConv2d {
     bias: Option<Tensor>,
     stride: usize,
     relu: bool,
 }
 
+#[cfg(feature = "cuda")]
 impl CustomOp2 for TaesdConv2d {
     fn name(&self) -> &'static str {
         "taesd_conv3x3"
@@ -177,6 +194,7 @@ impl CustomOp2 for TaesdConv2d {
 }
 
 /// Whether the custom kernel covers this conv (3x3, f16, cuda, groups=1, dilation=1).
+#[cfg(feature = "cuda")]
 pub fn covers(layer: &Conv2d, x: &Tensor) -> bool {
     if !enabled() || !x.device().is_cuda() || x.dtype() != DType::F16 {
         return false;
@@ -189,7 +207,15 @@ pub fn covers(layer: &Conv2d, x: &Tensor) -> bool {
     cfg.groups == 1 && cfg.dilation == 1 && k_h == 3 && k_w == 3 && (cfg.stride == 1 || cfg.stride == 2)
 }
 
+/// Non-CUDA stub: the custom SIMT kernel never applies, so always take the standard conv path.
+#[cfg(not(feature = "cuda"))]
+pub fn covers(_layer: &Conv2d, _x: &Tensor) -> bool {
+    let _ = DType::F16; // keep DType import used on all backends
+    false
+}
+
 /// Run the custom conv. `relu` fuses a ReLU into the epilogue. Caller must check `covers` first.
+#[cfg(feature = "cuda")]
 pub fn forward(layer: &Conv2d, x: &Tensor, relu: bool) -> Result<Tensor> {
     let op = TaesdConv2d {
         bias: layer.bias().cloned(),
@@ -197,4 +223,10 @@ pub fn forward(layer: &Conv2d, x: &Tensor, relu: bool) -> Result<Tensor> {
         relu,
     };
     x.apply_op2_no_bwd(layer.weight(), &op)
+}
+
+/// Non-CUDA stub: `covers()` is always false here, so this is never reached on Metal/Vulkan/CPU.
+#[cfg(not(feature = "cuda"))]
+pub fn forward(_layer: &Conv2d, _x: &Tensor, _relu: bool) -> Result<Tensor> {
+    hanzo_ml::bail!("customconv::forward is a cuda-only fast path (no metal/vulkan/cpu impl)")
 }

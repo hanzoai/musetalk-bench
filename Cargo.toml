@@ -17,6 +17,8 @@ serde = { version = "1", features = ["derive"] }
 [features]
 cuda = ["hanzo-ml/cuda", "hanzo-nn/cuda", "hanzo-quant/cuda"]
 cudnn = ["cuda", "hanzo-ml/cudnn", "hanzo-nn/cudnn"]
+metal = ["hanzo-ml/metal", "hanzo-nn/metal", "hanzo-quant/metal"]
+accelerate = ["hanzo-ml/accelerate", "hanzo-nn/accelerate", "hanzo-quant/accelerate"]
 
 [profile.release]
 opt-level = 3

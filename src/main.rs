@@ -219,6 +219,35 @@ fn pick_dtype() -> DType {
     }
 }
 
+/// Backend selection via MUSETALK_DEV: "cuda" | "metal" | (anything else / unset -> CPU).
+/// `Device::new_metal`/`new_cuda` are only compiled in when the matching backend feature is on,
+/// so the arms are cfg-gated; an unavailable backend bails with a clear message.
+fn pick_device() -> Result<Device> {
+    match std::env::var("MUSETALK_DEV").as_deref() {
+        Ok("cuda") => {
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(0)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                hanzo_ml::bail!("MUSETALK_DEV=cuda but binary not built with --features cuda")
+            }
+        }
+        Ok("metal") => {
+            #[cfg(feature = "metal")]
+            {
+                Device::new_metal(0)
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                hanzo_ml::bail!("MUSETALK_DEV=metal but binary not built with --features metal")
+            }
+        }
+        _ => Ok(Device::Cpu),
+    }
+}
+
 struct Agg {
     e: f64,
     u: f64,
@@ -380,7 +409,7 @@ fn run_verify() -> Result<()> {
     let audio_cpu = seeded_input(0xAA, &[1, 50, cfg.unet.cross_attention_dim], &cpu)?;
     let ref_img = model_cpu.forward(&face_cpu, &audio_cpu)?;
 
-    let gpu = Device::new_cuda(0)?;
+    let gpu = pick_device()?; // honors MUSETALK_DEV (cuda|metal); CPU-vs-CPU if unset
     let dtype = pick_dtype();
     let model_gpu = MuseTalk::new(
         cfg.clone(),
@@ -424,7 +453,7 @@ fn run_verify() -> Result<()> {
 fn run_selfcheck() -> Result<()> {
     let dir = std::env::var("MUSETALK_REF_DIR").unwrap_or_else(|_| "/tmp/musetalk_ref".to_string());
     let save = std::env::var("MUSETALK_REF_SAVE").is_ok();
-    let gpu = Device::new_cuda(0)?;
+    let gpu = pick_device()?;
     let dtype = pick_dtype();
     let cfg = MuseTalkConfig::default();
     let sz = cfg.resized_img;
@@ -477,10 +506,7 @@ fn run_realverify() -> Result<()> {
         .unwrap_or_else(|_| "/home/z/work/zen-dub-run/refdump".to_string());
     let wdir = std::env::var("MUSETALK_WDIR")
         .unwrap_or_else(|_| "/home/z/work/zen-dub-run/rustweights".to_string());
-    let dev = match std::env::var("MUSETALK_DEV").as_deref() {
-        Ok("cuda") => Device::new_cuda(0)?,
-        _ => Device::Cpu,
-    };
+    let dev = pick_device()?;
     let dtype = pick_dtype();
     let load = |n: &str| -> Result<Tensor> {
         Tensor::read_npy(format!("{refdir}/{n}.npy"))?.to_device(&dev)
@@ -557,7 +583,7 @@ fn run_pipebench() -> Result<()> {
     let pipe = std::env::var("MUSETALK_PIPE").is_ok();
     let outdir = std::env::var("MUSETALK_DUBOUT").unwrap_or_else(|_| "/tmp/native_dub".to_string());
     let outmp4 = std::env::var("MUSETALK_OUT").unwrap_or_else(|_| "/tmp/native_dub.mp4".to_string());
-    let dev = Device::new_cuda(0)?;
+    let dev = pick_device()?;
     let dtype = pick_dtype();
     let cfg = MuseTalkConfig::default();
     let sz = cfg.resized_img;
@@ -595,8 +621,8 @@ fn run_pipebench() -> Result<()> {
         }
     };
     println!(
-        "==== MuseTalk NATIVE pipebench  dev=cuda dtype={:?} frames={} batch={} sink={} ====",
-        dtype, nframes, bsz, if pipe { "ffmpeg-pipe" } else { "npy-dump" }
+        "==== MuseTalk NATIVE pipebench  dev={:?} dtype={:?} frames={} batch={} sink={} ====",
+        dev.location(), dtype, nframes, bsz, if pipe { "ffmpeg-pipe" } else { "npy-dump" }
     );
     let mut child = if pipe {
         Some(
@@ -669,10 +695,7 @@ fn run_dub() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
-    let dev = match std::env::var("MUSETALK_DEV").as_deref() {
-        Ok("cuda") => Device::new_cuda(0)?,
-        _ => Device::Cpu,
-    };
+    let dev = pick_device()?;
     let dtype = pick_dtype();
     std::fs::create_dir_all(&outdir).ok();
     let cfg = MuseTalkConfig::default();
@@ -732,10 +755,7 @@ fn run_taesd_verify() -> Result<()> {
     let taesd_path = std::env::var("TAESD_PATH").unwrap_or_else(|_| {
         "/home/z/.cache/huggingface/hub/models--madebyollin--taesd/snapshots/614f76814bbe30edbe2e627ace1c2234c81a2c0e/diffusion_pytorch_model.safetensors".to_string()
     });
-    let dev = match std::env::var("MUSETALK_DEV").as_deref() {
-        Ok("cuda") => Device::new_cuda(0)?,
-        _ => Device::Cpu,
-    };
+    let dev = pick_device()?;
     let dtype = pick_dtype();
     let load = |n: &str| -> Result<Tensor> {
         Tensor::read_npy(format!("{refdir}/{n}.npy"))?.to_device(&dev)
@@ -794,6 +814,8 @@ fn run_taesd_verify() -> Result<()> {
 /// Microbench: time the custom TAESD conv kernel vs the standard (cuDNN/im2col) path on the exact
 /// TAESD encoder/decoder conv shapes, and verify numeric parity (cosine). Forces f16 cuda.
 /// Each row: (C_in, C_out, H=W, stride). 3x3, pad 1.
+/// CUDA-only: it benchmarks the custom SIMT conv kernel (`customconv`), which has no Metal impl.
+#[cfg(feature = "cuda")]
 fn run_convbench() -> Result<()> {
     use hanzo_nn::{Conv2d, Conv2dConfig};
     let dev = Device::new_cuda(0)?;
@@ -875,10 +897,7 @@ fn run_convbench() -> Result<()> {
 
 fn main() -> Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "bench".to_string());
-    let dev = match std::env::var("MUSETALK_DEV").as_deref() {
-        Ok("cuda") => Device::new_cuda(0)?,
-        _ => Device::Cpu,
-    };
+    let dev = pick_device()?;
     match mode.as_str() {
         "verify" => run_verify()?,
         "selfcheck" => run_selfcheck()?,
@@ -886,7 +905,10 @@ fn main() -> Result<()> {
         "taesdverify" => run_taesd_verify()?,
         "dub" => run_dub()?,
         "pipebench" => run_pipebench()?,
+        #[cfg(feature = "cuda")]
         "convbench" => run_convbench()?,
+        #[cfg(not(feature = "cuda"))]
+        "convbench" => hanzo_ml::bail!("convbench is cuda-only (custom SIMT conv kernel)"),
         _ => run_bench(&dev)?,
     }
     Ok(())
